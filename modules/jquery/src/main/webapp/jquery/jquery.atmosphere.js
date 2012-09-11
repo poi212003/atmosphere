@@ -29,7 +29,7 @@
  * Official documentation of this library: https://github.com/Atmosphere/atmosphere/wiki/jQuery.atmosphere.js-API
  */
 jQuery.atmosphere = function() {
-    jQuery(window).unload(function() {
+    jQuery(window).bind("beforeunload", function() {
         jQuery.atmosphere.unsubscribe();
     });
 
@@ -45,7 +45,7 @@ jQuery.atmosphere = function() {
         version : "1.0",
         requests : [],
         callbacks : [],
-
+        connected:false,
         onError : function(response) {
         },
         onClose : function(response) {
@@ -99,11 +99,15 @@ jQuery.atmosphere = function() {
                 withCredentials : false,
                 trackMessageLength : false ,
                 messageDelimiter : '|',
+                //todo : myfxbook fix to keep the connection alive
+                pingTimeout : 35, //in seconds
+                lastPingTime:0,
                 connectTimeout : -1,
                 reconnectInterval : 0,
                 dropAtmosphereHeaders : true,
                 uuid : 0,
                 shared : false,
+                readResponsesHeaders : true,
                 onError : function(response) {
                 },
                 onClose : function(response) {
@@ -129,6 +133,9 @@ jQuery.atmosphere = function() {
             var _response = {
                 status: 200,
                 responseBody : '',
+                //todo: myfxbook fix for _trackedMessages
+                partialMessage: '',
+                junkFull:false,
                 expectedBodySize : -1,
                 headers : [],
                 state : "messageReceived",
@@ -485,7 +492,9 @@ jQuery.atmosphere = function() {
                         }
                     }
                 };
-            };
+            }
+
+            ;
 
             function share() {
                 var storageService, name = "atmosphere-" + _request.url, servers = {
@@ -561,7 +570,8 @@ jQuery.atmosphere = function() {
                                     win[key] = value;
                                 }
                             },
-                            close : function() {}
+                            close : function() {
+                            }
                         };
                     }
                 };
@@ -694,7 +704,7 @@ jQuery.atmosphere = function() {
 
                             _prepareCallback(msg, "messageReceived", 200, rq.transport);
 
-                            if (!rq.executeCallbackBeforeReconnect) {
+                            if (rq.executeCallbackBeforeReconnect) {
                                 _reconnect(_jqxhr, rq);
                             }
                         } else {
@@ -969,6 +979,9 @@ jQuery.atmosphere = function() {
 
                     if (!webSocketOpened) {
                         _open('opening', "websocket", _request);
+                    } else {
+                        //todo : myfxbook fix - need to readd in new version
+                        _request.onOpen(_request);
                     }
 
                     webSocketOpened = true;
@@ -1079,27 +1092,46 @@ jQuery.atmosphere = function() {
              * @param request
              * @param response
              */
+                //todo: myfxbook fix for missing messages when lots of them at once (multiple message being send at once)
             function _trackMessageSize(message, request, response) {
+
                 if (request.trackMessageLength) {
-                    // The message length is the included within the message
-                    var messageStart = message.indexOf(request.messageDelimiter);
+                    var messages = [];
+                    var messageEnd = message.indexOf(request.messageDelimiter);
 
-                    var length = response.expectedBodySize;
-                    if (messageStart != -1) {
-                        length = message.substring(0, messageStart);
-                        message = message.substring(messageStart + 1);
-                        response.expectedBodySize = length;
+                    //if no partial message from before then try to find full messages else -> append message to the partial one
+                    if (response.partialMessage.length == 0) {
+                        while (messageEnd != -1) {
+                            var fullMessage = message.substring(0, messageEnd);
+                            messages.push(fullMessage);
+                            message = message.substring(messageEnd + request.messageDelimiter.length, message.length);
+                            messageEnd = message.indexOf(request.messageDelimiter); //search for another full message
+
+                        }
                     }
 
-                    if (messageStart != -1) {
-                        response.responseBody = message;
-                    } else {
-                        response.responseBody += message;
+                    //check if partial message left
+                    if (message.length != 0) {
+                        response.partialMessage += message;
                     }
 
-                    if (response.responseBody.length != length) {
+
+                    //not let's try to find full messages in the partial one
+                    messageEnd = response.partialMessage.indexOf(request.messageDelimiter);
+                    while (messageEnd != -1) {
+                        fullMessage = response.partialMessage.substring(0, messageEnd); //get full message
+                        messages.push(fullMessage);
+                        response.partialMessage = response.partialMessage.substring(messageEnd + request.messageDelimiter.length, response.partialMessage.length); //remove the full message
+                        messageEnd = response.partialMessage.indexOf(request.messageDelimiter); //search for another full message
+                    }
+
+                    if (messages.length != 0) {
+                        response.responseBody = messages.join(request.messageDelimiter);
+                        return false;
+                    }
+                    else
                         return true;
-                    }
+
                 } else {
                     response.responseBody = message;
                 }
@@ -1162,6 +1194,8 @@ jQuery.atmosphere = function() {
                 url += "X-Atmosphere-tracking-id=" + rq.uuid;
                 url += "&X-Atmosphere-Framework=" + jQuery.atmosphere.version;
                 url += "&X-Atmosphere-Transport=" + rq.transport;
+                //todo:myfxbook fix - using client uuid instead the server cause of issues
+                url += "&token=" + TOKEN;
 
                 if (rq.trackMessageLength) {
                     url += "&X-Atmosphere-TrackMessageSize=" + "true";
@@ -1307,14 +1341,22 @@ jQuery.atmosphere = function() {
                             }
                         } else if (!jQuery.browser.msie && ajaxRequest.readyState == 3 && ajaxRequest.status == 200 && rq.transport != 'long-polling') {
                             update = true;
+//                            //todo: myfxbook fix for onOpen not invoked after reconnect
+                            if (!jQuery.atmosphere.connected) {
+                                jQuery.atmosphere.connected = true;
+                                _request.onOpen(_response)
+                            } else
+                                jQuery.atmosphere.connected = true;
                         } else {
                             clearTimeout(rq.id);
                         }
 
                         try {
-                            var tempUUID = ajaxRequest.getResponseHeader('X-Atmosphere-tracking-id');
-                            if (tempUUID != null || tempUUID != undefined) {
-                                _request.uuid = tempUUID.split(" ").pop();
+                            if (rq.readResponsesHeaders) {
+                                var tempUUID = ajaxRequest.getResponseHeader('X-Atmosphere-tracking-id');
+                                if (tempUUID != null || tempUUID != undefined) {
+                                    _request.uuid = tempUUID.split(" ").pop();
+                                }
                             }
                         } catch (e) {
                         }
@@ -1326,18 +1368,31 @@ jQuery.atmosphere = function() {
                             // Refused to get unsafe header
                             // Let the failure happens later with a better error message
                             try {
-                                var tempDate = ajaxRequest.getResponseHeader('X-Cache-Date');
-                                if (tempDate != null || tempDate != undefined) {
-                                    _request.lastTimestamp = tempDate.split(" ").pop();
+                                if (rq.readResponsesHeaders) {
+                                    var tempDate = ajaxRequest.getResponseHeader('X-Cache-Date');
+                                    if (tempDate != null || tempDate != undefined) {
+                                        _request.lastTimestamp = tempDate.split(" ").pop();
+                                    }
                                 }
                             } catch (e) {
                             }
 
                             if (rq.transport == 'streaming') {
+                                 //any message from the server will reset the last ping time
+                                rq.lastPingTime = (new Date()).getTime();
+
                                 var text = responseText.substring(rq.lastIndex, responseText.length);
                                 _response.isJunkEnded = true;
 
-                                if (rq.lastIndex == 0 && text.indexOf("<!-- Welcome to the Atmosphere Framework.") != -1) {
+                                //todo : myfxbook fix junk is comming in parts
+                                if (!_response.junkFull && (text.indexOf("<!-- Welcome to the Atmosphere Framework.") == -1 || text.indexOf("<!-- EOD -->") == -1)) {
+                                    return;
+                                }
+                                _response.junkFull = true;
+
+                                //if it's the start and we see the junk start
+                                //todo : myfxbook fix for reconnecting on chrome - junk is comming in parts
+                                if (rq.lastIndex == 0 && text.indexOf("<!-- Welcome to the Atmosphere Framework.") != -1 && text.indexOf("<!-- EOD -->") != -1) {
                                     _response.isJunkEnded = false;
                                 }
 
@@ -1348,6 +1403,8 @@ jQuery.atmosphere = function() {
 
                                     if (junkEnd > endOfJunkLength && junkEnd != text.length) {
                                         _response.responseBody = text.substring(junkEnd);
+                                        //todo : myfxbook fix for cache messages not going through the _trackMessageSize
+                                        skipCallbackInvocation = _trackMessageSize(_response.responseBody, rq, _response);
                                     } else {
                                         skipCallbackInvocation = true;
                                     }
@@ -1365,7 +1422,7 @@ jQuery.atmosphere = function() {
                                                 _response.headers = parseHeaders(ajaxRequest.getAllResponseHeaders());
 
                                                 // HOTFIX for firefox bug: https://bugzilla.mozilla.org/show_bug.cgi?id=608735
-                                                if (_request.headers) {
+                                                if (_request.readResponsesHeaders && _request.headers) {
                                                     jQuery.each(_request.headers, function(name) {
                                                         var v = ajaxRequest.getResponseHeader(name);
                                                         if (v) {
@@ -1404,7 +1461,7 @@ jQuery.atmosphere = function() {
                                 _response.headers = parseHeaders(ajaxRequest.getAllResponseHeaders());
 
                                 // HOTFIX for firefox bug: https://bugzilla.mozilla.org/show_bug.cgi?id=608735
-                                if (_request.headers) {
+                                if (_request.readResponsesHeaders && _request.headers) {
                                     jQuery.each(_request.headers, function(name) {
                                         var v = ajaxRequest.getResponseHeader(name);
                                         if (v) {
@@ -1453,6 +1510,12 @@ jQuery.atmosphere = function() {
                                 _execute();
                             }
                         }, rq.timeout);
+
+                        //todo: myfxbook fix for closing connection when network goes down abruptly
+                        rq.lastPingTime = (new Date()).getTime();
+                        rq.ping = setTimeout(function() {
+                            detectDeadConnection(ajaxRequest, rq);
+                        }, rq.pingTimeout * 1000);
                     }
                     _subscribed = true;
 
@@ -1460,6 +1523,29 @@ jQuery.atmosphere = function() {
                     jQuery.atmosphere.log(rq.logLevel, ["Max re-connection reached."]);
                     _onError();
                 }
+            }
+
+            /**
+             * keep track of last message that we got from the server, if reached pingTimeout - restart!
+             * @param ajaxRequest Ajax request.
+             * @param rq Request parameters.
+             */
+            function detectDeadConnection(ajaxRequest, rq) {
+                var pingPassed = (new Date().getTime() - rq.lastPingTime) / 1000;
+                if (pingPassed > rq.pingTimeout) {//if connected and no ping we'll assume connection was stopped abruptly and reset it manually
+                    if (ajaxRequest != null) {
+                        ajaxRequest.abort();
+                        _subscribe(rq);
+                        _execute();
+                    } else {
+                        _ieStreamingClose(rq);
+                        _ieStreaming(rq);
+                    }
+                }
+                clearTimeout(rq.ping);
+                rq.ping = setTimeout(function() {
+                    detectDeadConnection(ajaxRequest, rq);
+                }, (rq.pingTimeout - pingPassed) * 1000); //take into account the time passed from the last ping
             }
 
             /**
@@ -1521,6 +1607,7 @@ jQuery.atmosphere = function() {
             function _reconnect(ajaxRequest, request, force) {
                 if (force || (request.suspend && ajaxRequest.status == 200 && request.transport != 'streaming' && _subscribed)) {
                     if (request.reconnect) {
+                        jQuery.atmosphere.connected = false;
                         _open('re-opening', request.transport, request);
                         request.id = setTimeout(function() {
                             _executeRequest();
@@ -1588,7 +1675,10 @@ jQuery.atmosphere = function() {
                 };
                 // Handles error event
                 xdr.onerror = function() {
-                    _prepareCallback(xdr.responseText, "error", 500, transport);
+                    // If the server doesn't send anything back to XDR will fail with polling
+                    if (rq.transport != 'polling') {
+                        _prepareCallback(xdr.responseText, "error", 500, transport);
+                    }
                 };
                 // Handles close event
                 xdr.onload = function() {
@@ -1625,6 +1715,14 @@ jQuery.atmosphere = function() {
                         _prepareCallback(xdr.responseText, "closed", 200, transport);
                     }
                 };
+            }
+
+            function _ieStreamingClose(request) {
+                if (_ieStream != null) {
+                    _ieStream.close();
+                    _ieStream = null;
+                }
+                jQuery.atmosphere.connected = false;
             }
 
             // From jquery-stream, which is APL2 licensed as well.
@@ -1666,6 +1764,14 @@ jQuery.atmosphere = function() {
                         iframe.src = url;
                         doc.body.appendChild(iframe);
 
+                        //todo: myfxbook fix for closing connection when network goes down abruptly
+                        rq.lastPingTime = (new Date()).getTime();
+                        if (rq.ping == null) { // only for the first attempt
+                            rq.ping = setTimeout(function() {
+                                detectDeadConnection(null, rq);
+                            }, rq.pingTimeout * 1000);
+                        }
+
                         // For the server to respond in a consistent format regardless of user agent, we polls response text
                         var cdoc = iframe.contentDocument || iframe.contentWindow.document;
 
@@ -1687,6 +1793,8 @@ jQuery.atmosphere = function() {
 
                                 var res = cdoc.body ? cdoc.body.lastChild : cdoc;
                                 var readResponse = function() {
+                                    //todo: myfxbook fix for ie connected status
+                                    jQuery.atmosphere.connected = true;
                                     // Clones the element not to disturb the original one
                                     var clone = res.cloneNode(true);
 
@@ -1778,7 +1886,7 @@ jQuery.atmosphere = function() {
             function _push(message) {
 
                 if (_localStorageService != null) {
-                   _pushLocal(message);
+                    _pushLocal(message);
                 } else if (_activeRequest != null || _sse != null) {
                     _pushAjaxMessage(message);
                 } else if (_ieStream != null) {
@@ -1795,10 +1903,14 @@ jQuery.atmosphere = function() {
             }
 
             function _intraPush(message) {
-                 if (_localStorageService) {
-                    _localStorageService.localSend(message);
-                } else {
-                    _storageService.signal("localMessage",  jQuery.stringifyJSON({id: guid , event: message}));
+                try {
+                    if (_localStorageService) {
+                        _localStorageService.localSend(message);
+                    } else {
+                        _storageService.signal("localMessage", jQuery.stringifyJSON({id: guid , event: message}));
+                    }
+                } catch (err) {
+                    jQuery.atmosphere.error(err);
                 }
             }
 
@@ -1936,6 +2048,8 @@ jQuery.atmosphere = function() {
             function _prepareCallback(messageBody, state, errorCode, transport) {
 
                 if (state == "messageReceived") {
+                    //todo: myfxbook fix for IE - update last ping time
+                    _request.lastPingTime = (new Date()).getTime();
                     if (_trackMessageSize(messageBody, _request, _response)) return;
                 }
 
@@ -2060,9 +2174,9 @@ jQuery.atmosphere = function() {
 
                 // Are we the parent that hold the real connection.
                 if (_localStorageService == null && _localSocketF != null) {
-					// The heir is the parent unless _abordingConnection
+                    // The heir is the parent unless _abordingConnection
                     _storageService.signal("close", {reason: "", heir: !_abordingConnection ? guid : _storageService.get("children")[0]});
-                    document.cookie = encodeURIComponent("atmosphere-"+_request.url) + "=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+                    document.cookie = encodeURIComponent("atmosphere-" + _request.url) + "=; expires=Thu, 01 Jan 1970 00:00:00 GMT";
                 }
 
                 if (_storageService != null) {
@@ -2308,8 +2422,8 @@ jQuery.atmosphere = function() {
 /*
  * jQuery stringifyJSON
  * http://github.com/flowersinthesand/jquery-stringifyJSON
- * 
- * Copyright 2011, Donghwan Kim 
+ *
+ * Copyright 2011, Donghwan Kim
  * Licensed under the Apache License, Version 2.0
  * http://www.apache.org/licenses/LICENSE-2.0
  */
